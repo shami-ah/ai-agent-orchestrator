@@ -245,34 +245,83 @@ export class Orchestrator {
     return results;
   }
 
+  /**
+   * Execute a single task with CAMEL-style iterative critique loop:
+   * Worker → Validator → if rejected: feed feedback to Worker → retry
+   * Max rounds controlled by config.maxValidationRounds (default 3).
+   */
   private async executeOne(task: Task): Promise<Record<string, unknown>> {
     const workerAgents = await this.agentRegistry.getWorkers();
     if (workerAgents.length === 0) throw new Error("No worker agents registered");
 
     const workerAgent = workerAgents[0];
     const provider = getProvider(workerAgent.model);
-    const worker = new WorkerAgent(
-      workerAgent,
-      provider,
-      this.toolRegistry,
-      this.store,
-      this.eventBus,
-    );
 
     this.eventBus.emit({ type: "task:claimed", task, agentId: workerAgent.id });
 
     const memories = await this.memory.recall(task.goal, 3);
-    const result = await worker.run({
-      task,
-      memories: memories.map((m) => m.content),
-      parentGoal: task.parentId
-        ? (await this.store.getTask(task.parentId))?.goal
-        : undefined,
-    });
+    const parentGoal = task.parentId
+      ? (await this.store.getTask(task.parentId))?.goal
+      : undefined;
 
-    // Validate
-    const validation = await this.validate(task, result);
-    const validationData = validation.validation as ValidationResult | undefined;
+    let result: Record<string, unknown> = {};
+    let validation: Record<string, unknown> = {};
+    let validationData: ValidationResult | undefined;
+    const maxRounds = this.config.maxValidationRounds ?? 3;
+
+    for (let round = 0; round < maxRounds; round++) {
+      const worker = new WorkerAgent(
+        workerAgent,
+        provider,
+        this.toolRegistry,
+        this.store,
+        this.eventBus,
+      );
+
+      const criticFeedback = round > 0 && validationData?.feedback
+        ? `\n\n## Critic Feedback (Round ${round})\nYour previous attempt was rejected. Fix these issues:\n${validationData.feedback}\n\nDo NOT repeat the same mistakes.`
+        : "";
+
+      result = await worker.run({
+        task: {
+          ...task,
+          goal: task.goal + criticFeedback,
+        },
+        memories: memories.map((m) => m.content),
+        parentGoal,
+      });
+
+      // Validate
+      validation = await this.validate(task, result);
+      validationData = validation.validation as ValidationResult | undefined;
+
+      if (validationData?.approved) {
+        this.eventBus.emit({
+          type: "task:validated",
+          task,
+          round: round + 1,
+          approved: true,
+        });
+        break;
+      }
+
+      this.eventBus.emit({
+        type: "task:critique",
+        task,
+        round: round + 1,
+        feedback: validationData?.feedback ?? "Unknown",
+      });
+
+      // Store the failure in memory so future tasks learn from it
+      if (validationData?.feedback) {
+        await this.memory.store(
+          null,
+          task.id,
+          `Task "${task.goal}" rejected (round ${round + 1}): ${validationData.feedback}`,
+          "observation",
+        );
+      }
+    }
 
     if (validationData?.approved) {
       await this.store.updateTask(task.id, {
@@ -286,17 +335,17 @@ export class Orchestrator {
     } else {
       await this.store.updateTask(task.id, {
         status: TaskStatus.FAILED,
-        error: validationData?.feedback ?? "Validation failed",
+        error: validationData?.feedback ?? "Validation failed after all rounds",
         output: result,
       });
       this.eventBus.emit({
         type: "task:failed",
         task: { ...task, status: TaskStatus.FAILED },
-        error: validationData?.feedback ?? "Validation failed",
+        error: validationData?.feedback ?? "Validation failed after all rounds",
       });
     }
 
-    return { ...result, validation };
+    return { ...result, validation, rounds: maxRounds };
   }
 
   private async validate(

@@ -179,7 +179,9 @@ export type OrchestraEvent =
   | { type: "memory:stored"; memory: Memory }
   | { type: "run:started"; goal: string }
   | { type: "run:completed"; goal: string; result: Record<string, unknown> }
-  | { type: "run:failed"; goal: string; error: string };
+  | { type: "run:failed"; goal: string; error: string }
+  | { type: "task:validated"; task: Task; round: number; approved: boolean }
+  | { type: "task:critique"; task: Task; round: number; feedback: string };
 
 // --- Store Interface (adapter pattern) ---
 
